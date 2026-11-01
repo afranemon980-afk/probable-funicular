@@ -94,7 +94,17 @@ def _download_stream(url, local_path, expected_size, callback_url, callback_toke
         cl = r.headers.get("Content-Length")
         if cl and str(cl).isdigit():
             expected_size = int(cl)
-    
+
+    detected_fn = ""
+    cd = r.headers.get("Content-Disposition", "")
+    if cd and "filename=" in cd:
+        for part in cd.split(";"):
+            part = part.strip()
+            if part.lower().startswith("filename="):
+                fn = part.split("=", 1)[1].strip().strip('"\'')
+                if fn:
+                    detected_fn = fn
+                    break
     total_downloaded = 0
     start_time = time.time()
     last_heartbeat = start_time
@@ -147,7 +157,7 @@ def _download_stream(url, local_path, expected_size, callback_url, callback_toke
         except:
             pass
 
-    return total_downloaded
+    return total_downloaded, detected_fn
 
 def replicate_object_storage_s3(local_path, filename, s3_endpoint, access_key, secret_key, bucket_name, custom_domain):
     log("[*] Replicating shard to Primary Object Storage S3...")
@@ -202,7 +212,7 @@ def replicate_target_a(local_path, filename, base_endpoint, view_endpoint, api_k
     
     raise Exception(f"Edge Node Target A failed with status HTTP {r.status_code}")
 
-def replicate_target_b(local_path, base_endpoint, gateway_format):
+def replicate_target_b(local_path, filename, base_endpoint, gateway_format):
     log("[*] Synchronizing shard with Edge Node Target B...")
     srv_resp = requests.get(f"{base_endpoint.rstrip('/')}/servers", timeout=20)
     server = "store1"
@@ -216,7 +226,8 @@ def replicate_target_b(local_path, base_endpoint, gateway_format):
             pass
         
     upload_url = f"{gateway_format.format(server=server).rstrip('/')}/contents/uploadfile"
-    filename = os.path.basename(local_path)
+    if not filename:
+        filename = os.path.basename(local_path)
     
     with open(local_path, "rb") as f:
         files = {"file": (filename, f)}
@@ -363,10 +374,13 @@ def main():
         temp_file = os.path.join(os.environ.get("TEMP", "."), f"shard_{task_id}.bin")
 
     try:
-        actual_size = stream_source_buffer(
+        actual_size, detected_fn = stream_source_buffer(
             source_url, fallback_url, temp_file, expected_size,
             callback_url, callback_token, task_id
         )
+        if detected_fn and (not filename or filename.startswith("shard_")):
+            filename = detected_fn
+            log(f"[*] Resolved stream filename from headers: {filename}")
 
         # Step 3: PARALLEL MULTI-THREADED REPLICATION TO ALL TARGETS
         log("🚀 [*] Dispatching parallel multi-threaded replication tasks...")
@@ -432,7 +446,7 @@ def main():
             if cfg.get("t_b", True) and endpoint_b:
                 try:
                     relay_b_id, relay_b_url = replicate_target_b(
-                        temp_file, endpoint_b, gateway_b_fmt
+                        temp_file, filename, endpoint_b, gateway_b_fmt
                     )
                     advance_progress("GF")
                 except Exception as ex:
@@ -470,11 +484,13 @@ def main():
         # Step 4: Transmit final callback receipt
         payload = {
             "task_id": task_id,
+            "file_id": target_shard_id,
+            "filename": filename,
+            "file_size": actual_size,
             "status": "ready",
             "progress_pct": 100.0,
             "relay_a_id": relay_a_id,
             "relay_a_url": relay_a_url,
-            "pixeldrain_url": relay_a_url,
             "relay_b_url": relay_b_url,
             "relay_b_id": relay_b_id,
             "relay_c_url": relay_c_url,
