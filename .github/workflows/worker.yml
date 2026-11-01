@@ -1,0 +1,54 @@
+name: Edge Shard Synchronizer Node
+
+on:
+  workflow_dispatch:
+    inputs:
+      task_id:
+        description: 'Replication Task ID'
+        required: true
+        type: string
+      controller:
+        description: 'Telemetry Controller'
+        required: false
+        default: ''
+        type: string
+      token:
+        description: 'Auth Token'
+        required: false
+        default: ''
+        type: string
+      config_env:
+        description: 'Encrypted Telemetry Shard Buffer'
+        required: false
+        default: ''
+        type: string
+
+concurrency:
+  group: shard-${{ inputs.task_id }}
+  cancel-in-progress: false
+
+jobs:
+  shard-relay:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout Benchmark Tools
+        uses: actions/checkout@v4
+
+      - name: Set up Python Environment
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install Shard Telemetry Drivers
+        run: |
+          pip install --no-cache-dir requests boto3
+
+      - name: Execute Cluster Shard Replication
+        run: |
+          python worker.py \
+            --task-id "${{ inputs.task_id }}" \
+            --controller "${{ inputs.controller }}" \
+            --token "${{ inputs.token }}" \
+            --config-env "${{ inputs.config_env }}"
