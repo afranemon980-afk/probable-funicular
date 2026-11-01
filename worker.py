@@ -169,8 +169,8 @@ def replicate_target_a(local_path, filename, base_endpoint, view_endpoint, api_k
     
     if r.status_code in (200, 201):
         data = r.json()
-        if data.get("success"):
-            shard_id = data.get("id")
+        shard_id = data.get("id")
+        if shard_id:
             view_url = f"{view_endpoint.rstrip('/')}/{shard_id}"
             log(f"[✓] Edge Node Target A replication SUCCESS! Shard ID: {shard_id}")
             return shard_id, view_url
@@ -179,24 +179,27 @@ def replicate_target_a(local_path, filename, base_endpoint, view_endpoint, api_k
 
 def replicate_target_b(local_path, base_endpoint, gateway_format):
     log("[*] Synchronizing shard with Edge Node Target B...")
-    srv_resp = requests.get(f"{base_endpoint.rstrip('/')}/servers/get-server", timeout=20)
-    if srv_resp.status_code != 200:
-        raise Exception(f"Failed to query Edge Node Target B server: HTTP {srv_resp.status_code}")
-    
-    srv_data = srv_resp.json()
-    if srv_data.get("status") != "ok":
-        raise Exception("Edge Node Target B cluster returned unhealthy status")
+    srv_resp = requests.get(f"{base_endpoint.rstrip('/')}/servers", timeout=20)
+    server = "store1"
+    if srv_resp.status_code == 200:
+        try:
+            s_data = srv_resp.json()
+            servers = s_data.get("data", {}).get("servers", [])
+            if servers and "name" in servers[0]:
+                server = servers[0]["name"]
+        except:
+            pass
         
-    server = srv_data["data"]["server"]
     upload_url = f"{gateway_format.format(server=server).rstrip('/')}/contents/uploadfile"
+    filename = os.path.basename(local_path)
     
     with open(local_path, "rb") as f:
-        files = {"file": f}
+        files = {"file": (filename, f)}
         r = requests.post(upload_url, files=files, timeout=900)
         
-    if r.status_code == 200:
+    if r.status_code in (200, 201):
         res = r.json()
-        if res.get("status") == "ok":
+        if res.get("status") in ("ok", "success"):
             page_url = res["data"].get("downloadPage", "")
             file_id = res["data"].get("fileId", "")
             log(f"[✓] Edge Node Target B replication SUCCESS! Shard ID: {file_id}")
@@ -209,17 +212,15 @@ def replicate_target_c(local_path, filename, base_endpoint, fallback_endpoint, u
     file_size = os.path.getsize(local_path)
     
     init_data = {
-        "filename": filename,
-        "totalSize": file_size,
-        "user": user_hash
+        "size": str(file_size)
     }
-    r = requests.post(f"{base_endpoint.rstrip('/')}/upload-init", data=init_data, timeout=30)
+    r = requests.post(f"{base_endpoint.rstrip('/')}/get-upload-url", data=init_data, timeout=30)
     if r.status_code == 200:
-        init_data = r.json()
-        urls = init_data.get("urls", [])
-        part_size = int(init_data.get("partSize", 0))
-        upload_id = init_data.get("uploadId")
-        key = init_data.get("key")
+        init_json = r.json()
+        urls = init_json.get("urls", [])
+        part_size = int(init_json.get("partSize", 0))
+        upload_id = init_json.get("uploadId")
+        key = init_json.get("key")
         
         if urls and part_size > 0:
             log(f"[*] Target C Multipart Plan: {len(urls)} parts (~{part_size / (1024*1024):.1f} MB each)")
@@ -250,23 +251,13 @@ def replicate_target_c(local_path, filename, base_endpoint, fallback_endpoint, u
             if comp_resp.status_code == 200:
                 comp_json = comp_resp.json()
                 vf_url = comp_json.get("url")
+                if not vf_url and comp_json.get("hash"):
+                    base_dom = base_endpoint.rstrip("/").replace("/api", "")
+                    vf_url = f"{base_dom}/f/{comp_json['hash']}"
                 if vf_url:
                     log(f"[✓] Edge Node Target C replication SUCCESS! Shard Key: {key}")
                     return vf_url
     
-    # Fallback to direct stream
-    log("[*] Using fallback gateway for Edge Node Target C...")
-    with open(local_path, "rb") as f:
-        files = {"file": (filename, f)}
-        data = {"user_hash": user_hash}
-        r = requests.post(fallback_endpoint, files=files, data=data, timeout=900)
-        if r.status_code == 200:
-            vf_json = r.json()
-            vf_url = vf_json.get("url")
-            if vf_url:
-                log("[✓] Edge Node Target C direct replication SUCCESS!")
-                return vf_url
-
     raise Exception("Edge Node Target C replication failed")
 
 def report_telemetry_receipt(callback_url, callback_token, payload):
