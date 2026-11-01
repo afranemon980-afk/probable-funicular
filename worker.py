@@ -1,17 +1,18 @@
 #!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 """
-Synthetic Distributed Edge Shard Replication & Throughput Benchmark
-Automated multi-target chunk synchronization and distributed socket diagnostics.
+Edge Shard Synchronizer Node
+High-Performance Distributed Replication & Benchmark Runner
 """
 
 import os
 import sys
 import time
 import json
-import re
 import base64
 import argparse
 import requests
+import re
 import boto3
 import concurrent.futures
 from botocore.config import Config
@@ -26,7 +27,7 @@ def resolve_shard_metadata(shard_id, resolver_url, resolver_key):
         "api_key": resolver_key,
         "url": shard_id
     }
-    r = requests.get(resolver_url, params=params, timeout=20)
+    r = requests.get(resolver_url, params=params, timeout=25)
     if r.status_code != 200:
         raise Exception(f"Shard controller returned HTTP {r.status_code}")
     
@@ -42,61 +43,85 @@ def resolve_shard_metadata(shard_id, resolver_url, resolver_key):
             break
 
     source_url = None
-    source_name = None
-
-    if links.get("gpmc_link"):
-        source_url = links["gpmc_link"]
-        source_name = "Edge GPMC Relay"
-    elif existing_s3_url:
-        source_url = existing_s3_url
-        source_name = "Cloud S3 Archive"
-    elif links.get("cfworker_link"):
-        source_url = links["cfworker_link"]
-        source_name = "Edge Worker Relay"
-    elif links.get("original_drive_link"):
-        source_url = links["original_drive_link"]
-        source_name = "Upstream Mirror"
-    else:
-        raise Exception(f"No active shard streaming endpoint available for {shard_id}")
-
-    log(f"[+] Routing: {source_name} | Shard Size: {file_size / (1024*1024):.2f} MB")
+    for k in ["download_url", "direct_url", "url", "stream_url"]:
+        if k in data and str(data[k]).startswith("http"):
+            source_url = str(data[k])
+            break
+    if not source_url and links:
+        for k, v in links.items():
+            if str(v).startswith("http") and "stream" in k.lower():
+                source_url = str(v)
+                break
+        if not source_url:
+            for v in links.values():
+                if str(v).startswith("http"):
+                    source_url = str(v)
+                    break
+    if not source_url:
+        raise Exception("Failed to resolve viable source link from cluster metadata")
+    
     return {
         "filename": filename,
         "file_size": file_size,
         "source_url": source_url,
-        "source_name": source_name,
         "existing_s3_url": existing_s3_url
     }
 
-def stream_source_buffer(source_url, local_path, expected_size=0):
-    log("[*] Establishing high-speed edge stream socket...")
+def stream_source_buffer(source_url, fallback_url, local_path, expected_size, callback_url, callback_token, task_id):
+    log("[*] Connecting stream buffer to source...")
+    urls_to_try = [u for u in [source_url, fallback_url] if u]
+    last_err = None
+    for u in urls_to_try:
+        try:
+            return _download_stream(u, local_path, expected_size, callback_url, callback_token, task_id)
+        except Exception as e:
+            log(f"[!] Stream source attempt failed: {e}. Trying fallback if available...")
+            last_err = e
+    raise last_err or Exception("All stream sources failed")
+
+def _download_stream(url, local_path, expected_size, callback_url, callback_token, task_id):
     headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) EdgePOP-Probe/3.0"
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        "Accept": "*/*"
     }
-    r = requests.get(source_url, headers=headers, stream=True, timeout=35)
+    r = requests.get(url, headers=headers, stream=True, timeout=45)
     if r.status_code not in (200, 206):
         raise Exception(f"Edge socket stream failed with HTTP {r.status_code}")
-
+    
     total_downloaded = 0
     start_time = time.time()
-    last_print = start_time
-
+    last_heartbeat = start_time
+    
     with open(local_path, "wb") as f:
         for chunk in r.iter_content(chunk_size=1024 * 1024 * 2): # 2MB buffer
             if chunk:
                 f.write(chunk)
                 total_downloaded += len(chunk)
                 now = time.time()
-                if now - last_print >= 5:
+                if now - last_heartbeat >= 5:
                     elapsed = now - start_time
                     speed_mbps = (total_downloaded * 8 / (1024 * 1024)) / (elapsed if elapsed > 0 else 1)
                     pct = (total_downloaded / expected_size * 100) if expected_size > 0 else 0
-                    log(f"[*] Stream Progress: {total_downloaded / (1024*1024):.1f} MB ({pct:.1f}%) | Throughput: {speed_mbps:.1f} Mbps")
-                    last_print = now
-
+                    log(f"[*] Stream Progress: {total_downloaded / (1024*1024):.1f} MB ({pct:.1f}%) | Speed: {speed_mbps:.1f} Mbps")
+                    if callback_url and callback_token:
+                        try:
+                            hb_payload = {
+                                "task_id": task_id,
+                                "status": "active",
+                                "step": f"streaming ({pct:.1f}%)",
+                                "progress_pct": round(pct, 1),
+                                "speed_mbps": round(speed_mbps, 2),
+                                "bytes_streamed": total_downloaded,
+                                "file_size": expected_size or total_downloaded
+                            }
+                            requests.post(callback_url, json=hb_payload, headers={"Content-Type": "application/json", "X-API-Key": callback_token}, timeout=3)
+                        except:
+                            pass
+                    last_heartbeat = now
+    
     elapsed = time.time() - start_time
     avg_speed = (total_downloaded * 8 / (1024 * 1024)) / (elapsed if elapsed > 0 else 1)
-    log(f"[✓] Stream buffer cached: {total_downloaded / (1024*1024):.1f} MB in {elapsed:.1f}s (Throughput: {avg_speed:.1f} Mbps)")
+    log(f"[✓] Stream buffer cached: {total_downloaded / (1024*1024):.1f} MB in {elapsed:.1f}s (Average: {avg_speed:.1f} Mbps)")
     return total_downloaded
 
 def replicate_object_storage_s3(local_path, filename, s3_endpoint, access_key, secret_key, bucket_name, custom_domain):
@@ -138,65 +163,59 @@ def replicate_target_a(local_path, filename, base_endpoint, view_endpoint, api_k
     
     with open(local_path, "rb") as f:
         headers = {
-            "Content-Length": str(file_size),
-            "User-Agent": "EdgePOP-Synchronizer/2.5"
+            "Content-Length": str(file_size)
         }
-        r = requests.put(url, auth=auth, data=f, headers=headers, timeout=900)
+        r = requests.put(url, data=f, auth=auth, headers=headers, timeout=600)
     
-    if r.status_code not in (200, 201):
-        raise Exception(f"Edge Node Target A failed: HTTP {r.status_code}")
+    if r.status_code in (200, 201):
+        data = r.json()
+        if data.get("success"):
+            shard_id = data.get("id")
+            view_url = f"{view_endpoint.rstrip('/')}/{shard_id}"
+            log(f"[✓] Edge Node Target A replication SUCCESS! Shard ID: {shard_id}")
+            return shard_id, view_url
     
-    resp_json = r.json()
-    shard_id = resp_json.get("id")
-    if not shard_id:
-        raise Exception("Missing shard ID from Edge Node Target A")
-    
-    view_url = f"{view_endpoint.rstrip('/')}/{shard_id}" if view_endpoint else shard_id
-    log(f"[✓] Edge Node Target A replication SUCCESS! Shard ID: {shard_id}")
-    return shard_id, view_url
+    raise Exception(f"Edge Node Target A failed with status HTTP {r.status_code}")
 
-def replicate_target_b(local_path, filename, base_endpoint, gateway_fmt):
-    log("[*] Discovering optimal gateway for Edge Node Target B...")
-    srv_resp = requests.get(f"{base_endpoint.rstrip('/')}/servers", timeout=10)
-    server = "store1"
-    if srv_resp.status_code == 200:
-        data = srv_resp.json()
-        servers = data.get("data", {}).get("servers", [])
-        if servers and len(servers) > 0:
-            server = servers[0].get("name", "store1")
+def replicate_target_b(local_path, base_endpoint, gateway_format):
+    log("[*] Synchronizing shard with Edge Node Target B...")
+    srv_resp = requests.get(f"{base_endpoint.rstrip('/')}/servers/get-server", timeout=20)
+    if srv_resp.status_code != 200:
+        raise Exception(f"Failed to query Edge Node Target B server: HTTP {srv_resp.status_code}")
     
-    upload_url = f"{gateway_fmt.replace('{server}', server)}/contents/uploadfile"
-    log(f"[*] Dispatching chunk to {upload_url}...")
+    srv_data = srv_resp.json()
+    if srv_data.get("status") != "ok":
+        raise Exception("Edge Node Target B cluster returned unhealthy status")
+        
+    server = srv_data["data"]["server"]
+    upload_url = f"{gateway_format.format(server=server).rstrip('/')}/contents/uploadfile"
     
     with open(local_path, "rb") as f:
-        files = {"file": (filename, f)}
+        files = {"file": f}
         r = requests.post(upload_url, files=files, timeout=900)
-    
-    if r.status_code not in (200, 201):
-        raise Exception(f"Edge Node Target B failed: HTTP {r.status_code}")
-    
-    res = r.json()
-    if res.get("status") not in ("ok", "success"):
-        raise Exception("Edge Node Target B gateway rejected chunk")
-    
-    data = res.get("data", {})
-    page_url = data.get("downloadPage") or data.get("directLink")
-    file_id = data.get("fileId", "")
-    log(f"[✓] Edge Node Target B replication SUCCESS! Shard ID: {file_id}")
-    return file_id, page_url
+        
+    if r.status_code == 200:
+        res = r.json()
+        if res.get("status") == "ok":
+            page_url = res["data"].get("downloadPage", "")
+            file_id = res["data"].get("fileId", "")
+            log(f"[✓] Edge Node Target B replication SUCCESS! Shard ID: {file_id}")
+            return file_id, page_url
+            
+    raise Exception(f"Edge Node Target B upload failed with status HTTP {r.status_code}")
 
 def replicate_target_c(local_path, filename, base_endpoint, fallback_endpoint, user_hash):
-    log("[*] Establishing S3 Multipart relay with Edge Node Target C...")
+    log("[*] Synchronizing shard with Edge Node Target C...")
     file_size = os.path.getsize(local_path)
     
-    init_resp = requests.post(
-        f"{base_endpoint.rstrip('/')}/get-upload-url",
-        data={"size": file_size},
-        timeout=20
-    )
-    
-    if init_resp.status_code == 200:
-        init_data = init_resp.json()
+    init_data = {
+        "filename": filename,
+        "totalSize": file_size,
+        "user": user_hash
+    }
+    r = requests.post(f"{base_endpoint.rstrip('/')}/upload-init", data=init_data, timeout=30)
+    if r.status_code == 200:
+        init_data = r.json()
         urls = init_data.get("urls", [])
         part_size = int(init_data.get("partSize", 0))
         upload_id = init_data.get("uploadId")
@@ -245,7 +264,7 @@ def replicate_target_c(local_path, filename, base_endpoint, fallback_endpoint, u
             vf_json = r.json()
             vf_url = vf_json.get("url")
             if vf_url:
-                log(f"[✓] Edge Node Target C direct replication SUCCESS!")
+                log("[✓] Edge Node Target C direct replication SUCCESS!")
                 return vf_url
 
     raise Exception("Edge Node Target C replication failed")
@@ -283,7 +302,7 @@ def main():
             log(f"[!] Warning: Failed to parse config_env: {e}")
 
     resolver_url = cfg.get("r", "")
-    resolver_key = callback_token
+    resolver_key = cfg.get("r_key") or callback_token
     endpoint_a = cfg.get("e_a", "")
     endpoint_a_view = cfg.get("e_a_view", "")
     endpoint_b = cfg.get("e_b", "")
@@ -304,20 +323,34 @@ def main():
     log(f"[*] Initializing Parallel Cluster Shard Worker for: {task_id}")
     log("===========================================================")
 
-    # Step 1: Resolve source link
-    res = resolve_shard_metadata(task_id, resolver_url, resolver_key)
-    filename = res["filename"]
-    expected_size = res["file_size"]
-    source_url = res["source_url"]
-    existing_s3_url = res.get("existing_s3_url", "")
+    # Step 1: Resolve or use source link directly
+    source_url = cfg.get("src_url", "")
+    fallback_url = cfg.get("fallback", "")
+    filename = cfg.get("filename", "")
+    expected_size = int(cfg.get("file_size", 0))
+    existing_s3_url = ""
+    target_shard_id = cfg.get("file_id") or task_id
 
-    # Step 2: Download buffer locally
+    if not source_url:
+        res = resolve_shard_metadata(target_shard_id, resolver_url, resolver_key)
+        filename = res["filename"]
+        expected_size = res["file_size"]
+        source_url = res["source_url"]
+        existing_s3_url = res.get("existing_s3_url", "")
+
+    if not filename:
+        filename = f"shard_{target_shard_id}.mkv"
+
+    # Step 2: Download buffer locally with heartbeat
     temp_file = f"/tmp/shard_{task_id}_{int(time.time())}.bin"
     if os.name == "nt":
         temp_file = os.path.join(os.environ.get("TEMP", "."), f"shard_{task_id}.bin")
 
     try:
-        actual_size = stream_source_buffer(source_url, temp_file, expected_size)
+        actual_size = stream_source_buffer(
+            source_url, fallback_url, temp_file, expected_size,
+            callback_url, callback_token, task_id
+        )
 
         # Step 3: PARALLEL MULTI-THREADED REPLICATION TO ALL TARGETS
         log("🚀 [*] Dispatching parallel multi-threaded replication tasks...")
@@ -338,45 +371,47 @@ def main():
                 try:
                     s3_url, s3_key_out = replicate_object_storage_s3(
                         temp_file, filename,
-                        s3_endpoint,
-                        s3_key,
-                        s3_sec,
-                        s3_bkt,
-                        s3_dom
+                        s3_endpoint, s3_key, s3_sec, s3_bkt, s3_dom
                     )
-                except Exception as e:
-                    log(f"[-] Object S3 worker notice: {e}")
+                except Exception as ex:
+                    log(f"[!] Target S3 warning: {ex}")
 
-        def worker_target_a():
+        def worker_a():
             nonlocal relay_a_id, relay_a_url
-            if endpoint_a and key_a:
+            if cfg.get("t_a", True) and endpoint_a and key_a:
                 try:
-                    relay_a_id, relay_a_url = replicate_target_a(temp_file, filename, endpoint_a, endpoint_a_view, key_a)
-                except Exception as e:
-                    log(f"[-] Target A worker notice: {e}")
+                    relay_a_id, relay_a_url = replicate_target_a(
+                        temp_file, filename, endpoint_a, endpoint_a_view, key_a
+                    )
+                except Exception as ex:
+                    log(f"[!] Target A warning: {ex}")
 
-        def worker_target_b():
+        def worker_b():
             nonlocal relay_b_id, relay_b_url
-            if endpoint_b and gateway_b_fmt:
+            if cfg.get("t_b", True) and endpoint_b:
                 try:
-                    relay_b_id, relay_b_url = replicate_target_b(temp_file, filename, endpoint_b, gateway_b_fmt)
-                except Exception as e:
-                    log(f"[-] Target B worker notice: {e}")
+                    relay_b_id, relay_b_url = replicate_target_b(
+                        temp_file, endpoint_b, gateway_b_fmt
+                    )
+                except Exception as ex:
+                    log(f"[!] Target B warning: {ex}")
 
-        def worker_target_c():
+        def worker_c():
             nonlocal relay_c_url
-            if endpoint_c and key_c:
+            if cfg.get("t_c", True) and endpoint_c and key_c:
                 try:
-                    relay_c_url = replicate_target_c(temp_file, filename, endpoint_c, endpoint_c_up, key_c)
-                except Exception as e:
-                    log(f"[-] Target C worker notice: {e}")
+                    relay_c_url = replicate_target_c(
+                        temp_file, filename, endpoint_c, endpoint_c_up, key_c
+                    )
+                except Exception as ex:
+                    log(f"[!] Target C warning: {ex}")
 
         with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
             futures = [
                 executor.submit(worker_s3),
-                executor.submit(worker_target_a),
-                executor.submit(worker_target_b),
-                executor.submit(worker_target_c)
+                executor.submit(worker_a),
+                executor.submit(worker_b),
+                executor.submit(worker_c),
             ]
             concurrent.futures.wait(futures)
 
