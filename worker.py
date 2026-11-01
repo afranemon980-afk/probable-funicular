@@ -420,6 +420,8 @@ def main():
             "task_id": task_id,
             "status": "ready",
             "relay_a_id": relay_a_id,
+            "relay_a_url": relay_a_url,
+            "pixeldrain_url": relay_a_url,
             "relay_b_url": relay_b_url,
             "relay_b_id": relay_b_id,
             "relay_c_url": relay_c_url,
