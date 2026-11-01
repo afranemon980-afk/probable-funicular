@@ -14,6 +14,7 @@ import argparse
 import requests
 import re
 import boto3
+import threading
 import concurrent.futures
 from botocore.config import Config
 
@@ -88,6 +89,12 @@ def _download_stream(url, local_path, expected_size, callback_url, callback_toke
     if r.status_code not in (200, 206):
         raise Exception(f"Edge socket stream failed with HTTP {r.status_code}")
     
+    # Read Content-Length if expected_size was not passed or <= 0
+    if not expected_size or expected_size <= 0:
+        cl = r.headers.get("Content-Length")
+        if cl and str(cl).isdigit():
+            expected_size = int(cl)
+    
     total_downloaded = 0
     start_time = time.time()
     last_heartbeat = start_time
@@ -98,18 +105,19 @@ def _download_stream(url, local_path, expected_size, callback_url, callback_toke
                 f.write(chunk)
                 total_downloaded += len(chunk)
                 now = time.time()
-                if now - last_heartbeat >= 5:
+                if now - last_heartbeat >= 3: # heartbeat every 3 seconds
                     elapsed = now - start_time
                     speed_mbps = (total_downloaded * 8 / (1024 * 1024)) / (elapsed if elapsed > 0 else 1)
-                    pct = (total_downloaded / expected_size * 100) if expected_size > 0 else 0
-                    log(f"[*] Stream Progress: {total_downloaded / (1024*1024):.1f} MB ({pct:.1f}%) | Speed: {speed_mbps:.1f} Mbps")
+                    stream_pct = (total_downloaded / expected_size * 100) if expected_size > 0 else min(95.0, (total_downloaded / (300*1024*1024)) * 100)
+                    job_pct = stream_pct * 0.5 # Download is 0% -> 50% of the overall job
+                    log(f"[*] Stream Progress: {total_downloaded / (1024*1024):.1f} MB ({stream_pct:.1f}%) | Speed: {speed_mbps:.1f} Mbps")
                     if callback_url and callback_token:
                         try:
                             hb_payload = {
                                 "task_id": task_id,
                                 "status": "active",
-                                "step": f"streaming ({pct:.1f}%)",
-                                "progress_pct": round(pct, 1),
+                                "step": f"downloading source ({stream_pct:.1f}%) | {total_downloaded/(1024*1024):.1f} MB",
+                                "progress_pct": round(job_pct, 1),
                                 "speed_mbps": round(speed_mbps, 2),
                                 "bytes_streamed": total_downloaded,
                                 "file_size": expected_size or total_downloaded
@@ -122,6 +130,23 @@ def _download_stream(url, local_path, expected_size, callback_url, callback_toke
     elapsed = time.time() - start_time
     avg_speed = (total_downloaded * 8 / (1024 * 1024)) / (elapsed if elapsed > 0 else 1)
     log(f"[✓] Stream buffer cached: {total_downloaded / (1024*1024):.1f} MB in {elapsed:.1f}s (Average: {avg_speed:.1f} Mbps)")
+    
+    # Send 50% buffer cached heartbeat
+    if callback_url and callback_token:
+        try:
+            hb_payload = {
+                "task_id": task_id,
+                "status": "active",
+                "step": f"buffer ready ({total_downloaded/(1024*1024):.1f} MB) | broadcasting to mirrors",
+                "progress_pct": 50.0,
+                "speed_mbps": round(avg_speed, 2),
+                "bytes_streamed": total_downloaded,
+                "file_size": total_downloaded
+            }
+            requests.post(callback_url, json=hb_payload, headers={"Content-Type": "application/json", "X-API-Key": callback_token}, timeout=3)
+        except:
+            pass
+
     return total_downloaded
 
 def replicate_object_storage_s3(local_path, filename, s3_endpoint, access_key, secret_key, bucket_name, custom_domain):
@@ -353,10 +378,33 @@ def main():
         s3_url = existing_s3_url
         s3_key_out = ""
 
+        current_progress = 50.0
+        prog_lock = threading.Lock()
+
+        def advance_progress(name):
+            nonlocal current_progress
+            with prog_lock:
+                current_progress = min(96.0, current_progress + 11.5)
+                p = current_progress
+            if callback_url and callback_token:
+                try:
+                    hb_payload = {
+                        "task_id": task_id,
+                        "status": "active",
+                        "step": f"mirror {name} ready ({p:.1f}%) | broadcasting",
+                        "progress_pct": round(p, 1),
+                        "bytes_streamed": actual_size,
+                        "file_size": actual_size
+                    }
+                    requests.post(callback_url, json=hb_payload, headers={"Content-Type": "application/json", "X-API-Key": callback_token}, timeout=3)
+                except:
+                    pass
+
         def worker_s3():
             nonlocal s3_url, s3_key_out
             if s3_url:
                 log("[*] Verified existing Object Storage S3 chunk (Active)")
+                advance_progress("S3")
                 return
             if s3_active and s3_key and s3_sec and s3_bkt:
                 try:
@@ -364,6 +412,7 @@ def main():
                         temp_file, filename,
                         s3_endpoint, s3_key, s3_sec, s3_bkt, s3_dom
                     )
+                    advance_progress("S3")
                 except Exception as ex:
                     log(f"[!] Target S3 warning: {ex}")
 
@@ -374,6 +423,7 @@ def main():
                     relay_a_id, relay_a_url = replicate_target_a(
                         temp_file, filename, endpoint_a, endpoint_a_view, key_a
                     )
+                    advance_progress("PD")
                 except Exception as ex:
                     log(f"[!] Target A warning: {ex}")
 
@@ -384,6 +434,7 @@ def main():
                     relay_b_id, relay_b_url = replicate_target_b(
                         temp_file, endpoint_b, gateway_b_fmt
                     )
+                    advance_progress("GF")
                 except Exception as ex:
                     log(f"[!] Target B warning: {ex}")
 
@@ -394,6 +445,7 @@ def main():
                     relay_c_url = replicate_target_c(
                         temp_file, filename, endpoint_c, endpoint_c_up, key_c
                     )
+                    advance_progress("VF")
                 except Exception as ex:
                     log(f"[!] Target C warning: {ex}")
 
@@ -419,6 +471,7 @@ def main():
         payload = {
             "task_id": task_id,
             "status": "ready",
+            "progress_pct": 100.0,
             "relay_a_id": relay_a_id,
             "relay_a_url": relay_a_url,
             "pixeldrain_url": relay_a_url,
